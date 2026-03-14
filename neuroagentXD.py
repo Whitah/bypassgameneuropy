@@ -161,7 +161,7 @@ if __name__ == "__main__":
         
         obs, reward, terminated, truncated, info = env.step(action)
         
-        time.sleep(0.3) # Задержка, чтобы мы успели разглядеть, что он делает
+        time.sleep(0.3) 
         
         if terminated:
             env.render()
