@@ -167,3 +167,5 @@ if __name__ == "__main__":
             env.render()
             time.sleep(2) # Пауза после победы
             obs, info = env.reset()
+
+#TODO add new part of code
