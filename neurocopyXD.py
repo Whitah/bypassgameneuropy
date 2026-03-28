@@ -164,6 +164,7 @@ class MazeEnv(gym.Env):
             self.message = "🎉 Ура! Я добрался до цели!"
             self.stuck_steps = 0
         else:
+            # Если нет прогресса или постоянно отскакиваем, засчитываем как застревание
             if new_distance < old_distance:
                 self.stuck_steps = 0
             else:
@@ -176,7 +177,7 @@ class MazeEnv(gym.Env):
                 reward -= 5.0  # УСИЛЕНО: больший штраф за timeout
                 self.message = "⏱️ Время истекло!"
 
-        # Принудительный сброс при застревании
+        # Жёсткая защита от блуждания: принудительно пересоздаем лабиринт
         if self.stuck_steps >= 15 and not terminated:
             truncated = True
             reward -= 5.0
@@ -245,7 +246,7 @@ if __name__ == "__main__":
     print("   - Система вознаграждения за сближение к цели")
     print("   - Plus 100k шагов = мощное обучение!")
     
-    # Используем PPO с МАКСИМАЛьНО УСИЛЕННЫМИ параметрами для адаптивности
+    # Используем PPO с МАКСИМАЛЬНО УСИЛЕННЫМИ параметрами для адаптивности
     model = PPO(
         "MlpPolicy", 
         env, 
