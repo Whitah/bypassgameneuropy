@@ -46,6 +46,8 @@ class MazeEnvWithLearning(gym.Env):
         self.current_plan = []  # Текущий план действий
         self.plan_index = 0  # Индекс выполнения плана
         self.think_count = 0  # Счётчик обдумываний
+        self.failed_plan_count = 0  # Счётчик неудачных попыток найти путь
+        self.max_failed_plans = 3  # Сброс visited после 3 неудач
     
     def think_ahead(self, model, num_steps=5):
         """
@@ -56,20 +58,38 @@ class MazeEnvWithLearning(gym.Env):
         - Оптимальный путь к цели
         - Без циклов
         - С учётом стен
-        """
-        # Используем BFS для поиска оптимального пути
-        # Учитываем посещённые клетки, чтобы избежать циклов
-        visited_for_plan = self.visited.copy()
         
+        Если путь не найден (заблокирован), сбрасывает visited после max_failed_plans попыток.
+        """
+        # Пробуем сначала с обычным visited
         path = self._bfs_search(
             start=tuple(self.agent_pos),
             goal=tuple(self.target_pos),
             grid=self.grid,
-            visited=visited_for_plan
+            visited=self.visited.copy()
         )
         
+        # Если путь не найден - пробуем без visited (ищем любой путь, даже через посещённые)
         if not path:
-            return []  # Нет пути к цели
+            self.failed_plan_count += 1
+            
+            # После нескольких неудач - сбрасываем visited, чтобы искать заново
+            if self.failed_plan_count >= self.max_failed_plans:
+                self.visited = set([tuple(self.agent_pos)])  # Оставляем только текущую позицию
+                self.failed_plan_count = 0
+                # Пробуем ещё раз с чистым visited
+                path = self._bfs_search(
+                    start=tuple(self.agent_pos),
+                    goal=tuple(self.target_pos),
+                    grid=self.grid,
+                    visited=self.visited.copy()
+                )
+        
+        if not path:
+            return []  # Нет пути к цели вообще
+        
+        # Путь найден - сбрасываем счётчик неудач
+        self.failed_plan_count = 0
         
         # Преобразуем путь в список действий
         # path - это список координат [(r1,c1), (r2,c2), ...]
@@ -204,6 +224,7 @@ class MazeEnvWithLearning(gym.Env):
         self.current_plan = []
         self.plan_index = 0
         self.think_count = 0
+        self.failed_plan_count = 0  # Сброс счётчика неудачных планов
         
         return self.grid.copy(), {}
     
@@ -610,6 +631,12 @@ if __name__ == "__main__":
                 current_text = f"Сейчас: {action_names[current_action]}"
                 current_surface = font.render(current_text, True, RED)
                 window.blit(current_surface, (SCREEN_WIDTH - 120, SCREEN_HEIGHT - 40))
+        
+        # Показываем счётчик неудачных попыток найти путь
+        if env.failed_plan_count > 0:
+            fail_text = f"Путь закрыт! Попытка {env.failed_plan_count}/{env.max_failed_plans}"
+            fail_surface = font.render(fail_text, True, RED)
+            window.blit(fail_surface, (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT - 40))
         
         if paused:
             pause_text = font.render("ПАУЗА", True, RED)
