@@ -17,7 +17,7 @@ BLUE = (0, 0, 255)
 GREEN = (0, 255, 0)   
 GRAY = (200, 200, 200)
 RED = (255, 0, 0)    
-AGENT_SPEED_MS = 1  
+AGENT_SPEED_MS = 100  # Увеличено для замедления агента  
 
 class MazeEnvWithLearning(gym.Env):
     """Среда лабиринта с обучением PPO"""
@@ -34,6 +34,11 @@ class MazeEnvWithLearning(gym.Env):
         self.episode_count = 0
         self.visited = set()
         self.next_grid = None
+        self.last_action = None
+        self.last_collision = False
+        self.last_pos = None
+        self.position_history = deque(maxlen=12)
+        self.blocked_dirs = {}
         
     def generate_grid(self):
         grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
@@ -73,6 +78,12 @@ class MazeEnvWithLearning(gym.Env):
         self.grid[self.target_pos[0], self.target_pos[1]] = 2
         self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
         self.visited = set([tuple(self.agent_pos)])
+        self.last_action = None
+        self.last_collision = False
+        self.last_pos = None
+        self.position_history = deque(maxlen=12)
+        self.position_history.append(tuple(self.agent_pos))
+        self.blocked_dirs = {}
         
         return self.grid.copy(), {}
     
@@ -81,49 +92,150 @@ class MazeEnvWithLearning(gym.Env):
         old_pos = self.agent_pos.copy()
         old_distance = abs(self.agent_pos[0] - self.target_pos[0]) + abs(self.agent_pos[1] - self.target_pos[1])
         
-        if action == 0: self.agent_pos[0] -= 1
-        elif action == 1: self.agent_pos[1] += 1
-        elif action == 2: self.agent_pos[0] += 1
-        elif action == 3: self.agent_pos[1] -= 1
-        
-        reward = -0.02
+        if self.last_collision and self.last_pos == tuple(old_pos) and action == self.last_action:
+            # Не повторяем немедленное движение в ту же стену
+            for alt_action in [0, 1, 2, 3]:
+                if alt_action == action:
+                    continue
+                alt_pos = old_pos.copy()
+                if alt_action == 0:
+                    alt_pos[0] -= 1
+                elif alt_action == 1:
+                    alt_pos[1] += 1
+                elif alt_action == 2:
+                    alt_pos[0] += 1
+                elif alt_action == 3:
+                    alt_pos[1] -= 1
+                if 0 <= alt_pos[0] < self.grid_size and 0 <= alt_pos[1] < self.grid_size and self.grid[alt_pos[0], alt_pos[1]] != 1:
+                    action = alt_action
+                    break
+        self.agent_pos = old_pos.copy()
+        if action == 0:
+            self.agent_pos[0] -= 1
+        elif action == 1:
+            self.agent_pos[1] += 1
+        elif action == 2:
+            self.agent_pos[0] += 1
+        elif action == 3:
+            self.agent_pos[1] -= 1
+
+        reward = -0.1
         terminated = False
         truncated = False
         
+        # Штраф за приближение к границам и стенам (lookahead)
+        border_penalty = 0
+        if old_pos[0] <= 1 or old_pos[0] >= self.grid_size - 2:
+            border_penalty -= 0.15
+        if old_pos[1] <= 1 or old_pos[1] >= self.grid_size - 2:
+            border_penalty -= 0.15
+
         collision = (self.agent_pos[0] < 0 or self.agent_pos[0] >= self.grid_size or
                      self.agent_pos[1] < 0 or self.agent_pos[1] >= self.grid_size or
                      self.grid[self.agent_pos[0], self.agent_pos[1]] == 1)
-        
-        if collision or tuple(self.agent_pos) in self.visited:
-            # При столкновении или повторении используем BFS для выбора пути к цели
-            next_step = get_next_best_step(self.grid, old_pos, self.target_pos, self.visited)
-            if next_step:
-                self.agent_pos = list(next_step)
+
+        horizontal_bonus = False
+        if collision:
+            # Агент получил информацию о блоке и ищет соседнюю клетку, чтобы не останавливаться
+            is_boundary_collision = (self.agent_pos[0] < 0 or self.agent_pos[0] >= self.grid_size or
+                                      self.agent_pos[1] < 0 or self.agent_pos[1] >= self.grid_size)
+            reward = -3.0 if is_boundary_collision else -2.5
+            self.agent_pos = old_pos
+            free_neighbors = []
+            visited_neighbors = []
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = old_pos[0] + dr, old_pos[1] + dc
+                if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size and self.grid[nr, nc] != 1:
+                    if (nr, nc) not in self.visited:
+                        free_neighbors.append((nr, nc))
+                    else:
+                        visited_neighbors.append((nr, nc))
+            chosen = None
+            if free_neighbors:
+                fresh_free = [pos for pos in free_neighbors if pos not in self.position_history]
+                if fresh_free:
+                    free_neighbors = fresh_free
+                chosen = min(
+                    free_neighbors,
+                    key=lambda pos: abs(pos[0] - self.target_pos[0]) + abs(pos[1] - self.target_pos[1])
+                )
+                self.agent_pos = list(chosen)
                 new_distance = abs(self.agent_pos[0] - self.target_pos[0]) + abs(self.agent_pos[1] - self.target_pos[1])
                 if new_distance < old_distance:
                     progress = old_distance - new_distance
-                    reward = 1.0 + 2 * progress  # Награда за прогресс к цели
+                    reward = 1.0 + progress
                 else:
-                    reward = -0.5  # Штраф за отклонение
+                    reward = -1.5
+                if self.agent_pos[0] == old_pos[0] and tuple(self.agent_pos) not in self.position_history:
+                    horizontal_bonus = True
+                # Штраф за оставание близко к границе
+                if self.agent_pos[0] <= 1 or self.agent_pos[0] >= self.grid_size - 2:
+                    reward -= 0.2
+                if self.agent_pos[1] <= 1 or self.agent_pos[1] >= self.grid_size - 2:
+                    reward -= 0.2
+            elif visited_neighbors:
+                fresh_visited = [pos for pos in visited_neighbors if pos not in self.position_history]
+                if fresh_visited:
+                    visited_neighbors = fresh_visited
+                def neighbor_score(pos):
+                    unvisited_count = 0
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        ar, ac = pos[0] + dr, pos[1] + dc
+                        if 0 <= ar < self.grid_size and 0 <= ac < self.grid_size:
+                            if self.grid[ar, ac] == 0 and (ar, ac) not in self.visited:
+                                unvisited_count += 1
+                    return (-unvisited_count, abs(pos[0] - self.target_pos[0]) + abs(pos[1] - self.target_pos[1]))
+                chosen = min(visited_neighbors, key=neighbor_score)
+                self.agent_pos = list(chosen)
+                reward = -1.0
+                if self.agent_pos[0] == old_pos[0] and tuple(self.agent_pos) not in self.position_history:
+                    horizontal_bonus = True
+            if chosen is not None:
                 self.grid[old_pos[0], old_pos[1]] = 0
                 self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
                 self.visited.add(tuple(self.agent_pos))
-            else:
-                # Если пути нет, возвращаемся и штрафуем
-                self.agent_pos = old_pos
-                reward = -0.10
+                self.position_history.append(tuple(self.agent_pos))
+                if horizontal_bonus:
+                    reward += 0.5
+            self.last_collision = True
+            self.last_action = action
+            self.last_pos = tuple(old_pos)
         else:
-            new_distance = abs(self.agent_pos[0] - self.target_pos[0]) + abs(self.agent_pos[1] - self.target_pos[1])
-            if new_distance < old_distance:
-                progress = old_distance - new_distance
-                reward = 2.0 + 1.5 * progress  # Повышенная награда за прогресс
-            elif new_distance == old_distance:
-                reward = -0.1
+            self.last_collision = False
+            self.last_action = action
+            self.last_pos = tuple(old_pos)
+            if tuple(self.agent_pos) in self.visited:
+                # Штраф за повторение позиции, но используем историю, чтобы избегать циклов
+                reward = -1.2
+                self.grid[old_pos[0], old_pos[1]] = 0
+                self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
+                self.visited.add(tuple(self.agent_pos))
+                self.position_history.append(tuple(self.agent_pos))
+                # Штраф за остановку близко к границе
+                if self.agent_pos[0] <= 1 or self.agent_pos[0] >= self.grid_size - 2:
+                    reward -= 0.1
+                if self.agent_pos[1] <= 1 or self.agent_pos[1] >= self.grid_size - 2:
+                    reward -= 0.1
             else:
-                reward = -0.5
-            self.grid[old_pos[0], old_pos[1]] = 0
-            self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
-            self.visited.add(tuple(self.agent_pos))
+                new_distance = abs(self.agent_pos[0] - self.target_pos[0]) + abs(self.agent_pos[1] - self.target_pos[1])
+                if new_distance < old_distance:
+                    progress = old_distance - new_distance
+                    reward = 2.0 + 1.5 * progress  # Повышенная награда за прогресс
+                elif new_distance == old_distance:
+                    reward = -0.3
+                else:
+                    reward = -1.2
+                if self.agent_pos[0] == old_pos[0] and tuple(self.agent_pos) not in self.position_history:
+                    horizontal_bonus = True
+                # Штраф за движение к границе
+                if self.agent_pos[0] <= 1 or self.agent_pos[0] >= self.grid_size - 2:
+                    reward -= 0.1
+                if self.agent_pos[1] <= 1 or self.agent_pos[1] >= self.grid_size - 2:
+                    reward -= 0.1
+                self.grid[old_pos[0], old_pos[1]] = 0
+                self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
+                self.visited.add(tuple(self.agent_pos))
+                self.position_history.append(tuple(self.agent_pos))
         
         if self.agent_pos == self.target_pos:
             reward = 50.0  # Значительно повышена награда за достижение цели
@@ -132,6 +244,7 @@ class MazeEnvWithLearning(gym.Env):
         if self.step_count >= self.max_steps:
             truncated = True
         
+        reward += border_penalty  # Добавляем штраф за приближение к границам
         return self.grid.copy(), reward, terminated, truncated, {}
 
 def get_next_best_step(grid, start_pos, target_pos, visited=None):
@@ -213,7 +326,7 @@ if __name__ == "__main__":
     font = pygame.font.SysFont('Arial', 18)
     clock = pygame.time.Clock()
     
-    obs, _ = env.reset()
+    obs, _ = env.reset()    
     grid = obs.copy()
     agent_pos = env.agent_pos.copy()
     target_pos = env.target_pos.copy()
@@ -317,13 +430,8 @@ if __name__ == "__main__":
                 grid_changed = False  # Сбрасываем флаг при новом лабиринте
                 message = f"Новый лабиринт! Усиленных обучений: {training_episodes}"
             elif truncated:
-                message = "Время вышло, обучение и перезапуск текущего лабиринта"
-                # Обучение после таймаута (также интенсивнее)
-                model.learn(total_timesteps=5000, reset_num_timesteps=False)
-                training_episodes += 1
-                os.makedirs("models", exist_ok=True)
-                model.save(f"models/ppo_maze_model_{current_grid_size}")
-                # Перезапуск текущего лабиринта
+                message = "Время вышло, перезапуск текущего лабиринта"
+                # Перезапуск текущего лабиринта без дополнительного обучения
                 obs, _ = env.reset(options={'restart_current': True})
                 grid = obs.copy()
                 agent_pos = env.agent_pos.copy()
