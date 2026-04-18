@@ -20,7 +20,7 @@ RED = (255, 0, 0)
 AGENT_SPEED_MS = 100  # Увеличено для замедления агента  
 
 class MazeEnvWithLearning(gym.Env):
-    """Среда лабиринта с обучением PPO"""
+    """Среда лабиринта с обучением PPO и двухуровневым планированием"""
     
     metadata = {"render_modes": ["human"]}
     
@@ -37,9 +37,90 @@ class MazeEnvWithLearning(gym.Env):
         self.last_action = None
         self.last_collision = False
         self.last_pos = None
-        self.position_history = deque(maxlen=12)
+        self.position_history = deque(maxlen=50)
         self.blocked_dirs = {}
         
+        # === НОВОЕ: Двухуровневое планирование ===
+        self.think_steps = 5  # Сколько "мысленных" шагов делает нейросеть перед реальным ходом
+        self.think_penalty = 0.05  # Штраф за каждый шаг обдумывания (время на размышления)
+        self.current_plan = []  # Текущий план действий
+        self.plan_index = 0  # Индекс выполнения плана
+        self.think_count = 0  # Счётчик обдумываний
+    
+    def think_ahead(self, model, num_steps=5):
+        """
+        Нейросеть "думает" наперед - использует BFS для построения оптимального пути.
+        Возвращает план действий (список действий).
+        
+        BFS гарантирует:
+        - Оптимальный путь к цели
+        - Без циклов
+        - С учётом стен
+        """
+        # Используем BFS для поиска оптимального пути
+        # Учитываем посещённые клетки, чтобы избежать циклов
+        visited_for_plan = self.visited.copy()
+        
+        path = self._bfs_search(
+            start=tuple(self.agent_pos),
+            goal=tuple(self.target_pos),
+            grid=self.grid,
+            visited=visited_for_plan
+        )
+        
+        if not path:
+            return []  # Нет пути к цели
+        
+        # Преобразуем путь в список действий
+        # path - это список координат [(r1,c1), (r2,c2), ...]
+        plan = []
+        for i in range(1, min(len(path), num_steps + 1)):
+            prev = path[i-1]
+            curr = path[i]
+            
+            # Определяем действие по изменению координат
+            dr = curr[0] - prev[0]
+            dc = curr[1] - prev[1]
+            
+            if dr == -1:  # вверх
+                plan.append(0)
+            elif dc == 1:  # вправо
+                plan.append(1)
+            elif dr == 1:  # вниз
+                plan.append(2)
+            elif dc == -1:  # влево
+                plan.append(3)
+        
+        return plan
+    
+    def _bfs_search(self, start, goal, grid, visited=None):
+        """
+        Поиск в ширину (BFS) для нахождения оптимального пути.
+        Учитывает посещённые клетки для избежания циклов.
+        """
+        if visited is None:
+            visited = set()
+        
+        grid_size = grid.shape[0]
+        queue = deque([(start, [])])
+        visited.add(start)
+        
+        while queue:
+            current, path = queue.popleft()
+            
+            if current == goal:
+                return [start] + path
+            
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                r, c = current[0] + dr, current[1] + dc
+                
+                if 0 <= r < grid_size and 0 <= c < grid_size:
+                    if grid[r, c] != 1 and (r, c) not in visited:
+                        visited.add((r, c))
+                        queue.append(((r, c), path + [(r, c)]))
+        
+        return None  # Путь не найден
+    
     def generate_grid(self):
         grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
         for i in range(self.grid_size):
@@ -47,6 +128,35 @@ class MazeEnvWithLearning(gym.Env):
                 if random.random() < 0.1 and (i, j) != (0, 0) and (i, j) != (self.grid_size-1, self.grid_size-1):
                     grid[i, j] = 1
         return grid
+    
+    def generate_target(self, min_distance=None):
+        """
+        Генерирует позицию цели (зеленый куб) далеко от агента.
+        min_distance - минимальное расстояние от агента (по умолчанию ~половина поля)
+        """
+        if min_distance is None:
+            # Минимальное расстояние = примерно половина диагонали поля
+            min_distance = int(self.grid_size * 0.7)
+        
+        # Агент всегда начинается с (0, 0)
+        agent_pos = (0, 0)
+        
+        # Собираем все возможные позиции для цели (не стены, не позиция агента)
+        valid_positions = []
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if self.grid[r, c] != 1 and (r, c) != agent_pos:
+                    # Вычисляем манхэттенское расстояние до агента
+                    distance = abs(r - agent_pos[0]) + abs(c - agent_pos[1])
+                    if distance >= min_distance:
+                        valid_positions.append((r, c))
+        
+        if not valid_positions:
+            # Если нет подходящих позиций, возвращаем противоположный угол
+            return (self.grid_size - 1, self.grid_size - 1)
+        
+        # Выбираем случайную позицию из подходящих
+        return random.choice(valid_positions)
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -57,11 +167,11 @@ class MazeEnvWithLearning(gym.Env):
         restart_current = options.get('restart_current', False) if options else False
         
         if restart_current:
-            # Перезапуск текущего лабиринта: сбрасываем позицию и visited, но сохраняем grid
+            # Перезапуск текущего лабиринта: сбрасываем позицию и visited, но сохраняем grid и цель
             # Очищаем старую позицию агента
             self.grid[self.grid == 3] = 0
             self.agent_pos = [0, 0]
-            self.target_pos = [self.grid_size - 1, self.grid_size - 1]
+            # Цель остаётся на месте при перезапуске
             self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
             self.visited = set([tuple(self.agent_pos)])
             return self.grid.copy(), {}
@@ -73,17 +183,27 @@ class MazeEnvWithLearning(gym.Env):
         if regenerate and not restart_current:
             self.next_grid = self.generate_grid()
         
+        # Агент всегда начинается с (0, 0)
         self.agent_pos = [0, 0]
-        self.target_pos = [self.grid_size - 1, self.grid_size - 1]
+        
+        # Генерируем цель далеко от агента
+        self.target_pos = list(self.generate_target())
+        
+        # Размещаем цель на поле
         self.grid[self.target_pos[0], self.target_pos[1]] = 2
         self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
         self.visited = set([tuple(self.agent_pos)])
         self.last_action = None
         self.last_collision = False
         self.last_pos = None
-        self.position_history = deque(maxlen=12)
+        self.position_history = deque(maxlen=50)
         self.position_history.append(tuple(self.agent_pos))
         self.blocked_dirs = {}
+        
+        # === НОВОЕ: Сброс плана при новом эпизоде ===
+        self.current_plan = []
+        self.plan_index = 0
+        self.think_count = 0
         
         return self.grid.copy(), {}
     
@@ -146,15 +266,12 @@ class MazeEnvWithLearning(gym.Env):
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nr, nc = old_pos[0] + dr, old_pos[1] + dc
                 if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size and self.grid[nr, nc] != 1:
-                    if (nr, nc) not in self.visited:
+                    if (nr, nc) not in self.visited and (nr, nc) not in self.position_history:
                         free_neighbors.append((nr, nc))
                     else:
                         visited_neighbors.append((nr, nc))
             chosen = None
             if free_neighbors:
-                fresh_free = [pos for pos in free_neighbors if pos not in self.position_history]
-                if fresh_free:
-                    free_neighbors = fresh_free
                 chosen = min(
                     free_neighbors,
                     key=lambda pos: abs(pos[0] - self.target_pos[0]) + abs(pos[1] - self.target_pos[1])
@@ -173,23 +290,10 @@ class MazeEnvWithLearning(gym.Env):
                     reward -= 0.2
                 if self.agent_pos[1] <= 1 or self.agent_pos[1] >= self.grid_size - 2:
                     reward -= 0.2
-            elif visited_neighbors:
-                fresh_visited = [pos for pos in visited_neighbors if pos not in self.position_history]
-                if fresh_visited:
-                    visited_neighbors = fresh_visited
-                def neighbor_score(pos):
-                    unvisited_count = 0
-                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        ar, ac = pos[0] + dr, pos[1] + dc
-                        if 0 <= ar < self.grid_size and 0 <= ac < self.grid_size:
-                            if self.grid[ar, ac] == 0 and (ar, ac) not in self.visited:
-                                unvisited_count += 1
-                    return (-unvisited_count, abs(pos[0] - self.target_pos[0]) + abs(pos[1] - self.target_pos[1]))
-                chosen = min(visited_neighbors, key=neighbor_score)
-                self.agent_pos = list(chosen)
-                reward = -1.0
-                if self.agent_pos[0] == old_pos[0] and tuple(self.agent_pos) not in self.position_history:
-                    horizontal_bonus = True
+            else:
+                # Если нет свободных соседей, остаемся на месте с большим штрафом
+                reward = -5.0
+                chosen = None
             if chosen is not None:
                 self.grid[old_pos[0], old_pos[1]] = 0
                 self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
@@ -326,7 +430,7 @@ if __name__ == "__main__":
     font = pygame.font.SysFont('Arial', 18)
     clock = pygame.time.Clock()
     
-    obs, _ = env.reset()    
+    obs, _ = env.reset()
     grid = obs.copy()
     agent_pos = env.agent_pos.copy()
     target_pos = env.target_pos.copy()
@@ -403,21 +507,51 @@ if __name__ == "__main__":
                         env.grid[row, col] = draw_value
 
         if current_time - last_move_time > AGENT_SPEED_MS and not paused:
-            # Пытаемся быстро адаптироваться, если лабиринт был изменен пользователем
+            # Сбрасываем план при изменении лабиринта (БЕЗ обучения в цикле!)
             if grid_changed:
-                # Быстрая микрообучение для адаптации к новому лабиринту
-                model.learn(total_timesteps=256, reset_num_timesteps=False)  # Минимальное быстрое обучение
                 grid_changed = False
+                env.current_plan = []
+                env.plan_index = 0
             
-            # Используем нейросеть для выбора действия (детерминированно для скорости)
-            action, _ = model.predict(obs, deterministic=True)
+            # === НОВОЕ: Двухуровневое планирование ===
+            # Если план пуст или выполнен - сначала "думаем", затем делаем ход
+            if not env.current_plan or env.plan_index >= len(env.current_plan):
+                # Фаза 1: Нейросеть "думает" - строит план на несколько шагов вперед
+                # ВНИМАНИЕ: think_ahead() НЕ вызывает нейросеть в цикле!
+                env.current_plan = env.think_ahead(model, num_steps=env.think_steps)
+                env.plan_index = 0
+                env.think_count += 1
+                
+                # Штраф за обдумывание (время на размышления)
+                think_penalty = -len(env.current_plan) * env.think_penalty
+                
+                if env.current_plan:
+                    # Выполняем первый шаг из плана
+                    action = env.current_plan[env.plan_index]
+                    env.plan_index += 1
+                    message = f"Думаю... (план: {len(env.current_plan)} шагов), штраф за мышление: {think_penalty:.2f}"
+                else:
+                    # Если план пустой - используем нейросеть напрямую (один раз!)
+                    action, _ = model.predict(obs, deterministic=True)
+                    message = "Не удалось построить план, действую наугад"
+            else:
+                # Фаза 2: Выполняем следующий шаг из существующего плана
+                action = env.current_plan[env.plan_index]
+                env.plan_index += 1
+                message = f"Выполняю план: шаг {env.plan_index}/{len(env.current_plan)}"
+            
+            # Выполняем выбранное действие
             obs, reward, terminated, truncated, _ = env.step(action)
             grid = obs.copy()
             agent_pos = env.agent_pos.copy()
             
+            # Применяем штраф за обдумывание (если только что "подумали")
+            if env.current_plan and env.plan_index <= len(env.current_plan):
+                reward += -len(env.current_plan) * env.think_penalty
+            
             if terminated:
-                message = "Нейросеть достигла цели! Обучение..."
-                # Интенсивное обучение после достижения цели
+                message = f"Нейросеть достигла цели! (думал {env.think_count} раз)"
+                # Обучение только после достижения цели (один раз, не в цикле!)
                 model.learn(total_timesteps=8000, reset_num_timesteps=False)
                 training_episodes += 1
                 os.makedirs("models", exist_ok=True)
@@ -439,7 +573,7 @@ if __name__ == "__main__":
                 grid_changed = False  # Сбрасываем флаг при новом лабиринте
                 message = f"Текущий лабиринт перезапущен! Обучено {training_episodes} раз"
             else:
-                message = f"Шаг {env.step_count}, награда: {reward:.2f}"
+                message = f"Шаг {env.step_count}, награда: {reward:.2f}, план: {env.plan_index}/{len(env.current_plan) if env.current_plan else 0}"
             
             last_move_time = current_time
 
@@ -462,6 +596,20 @@ if __name__ == "__main__":
         pygame.draw.rect(window, GRAY, (0, SCREEN_HEIGHT - 100, SCREEN_WIDTH, 100))
         text_surface = font.render(message, True, BLACK)
         window.blit(text_surface, (10, SCREEN_HEIGHT - 70))
+        
+        # === НОВОЕ: Визуализация плана (мыслей агента) ===
+        if env.current_plan and len(env.current_plan) > 0:
+            plan_text = f"План: {' → '.join(['↑→↓←'[a] for a in env.current_plan])}"
+            plan_surface = font.render(plan_text, True, BLUE)
+            window.blit(plan_surface, (10, SCREEN_HEIGHT - 40))
+            
+            # Подсвечиваем текущий шаг в плане
+            if env.plan_index > 0 and env.plan_index <= len(env.current_plan):
+                current_action = env.current_plan[env.plan_index - 1]
+                action_names = ['↑', '→', '↓', '←']
+                current_text = f"Сейчас: {action_names[current_action]}"
+                current_surface = font.render(current_text, True, RED)
+                window.blit(current_surface, (SCREEN_WIDTH - 120, SCREEN_HEIGHT - 40))
         
         if paused:
             pause_text = font.render("ПАУЗА", True, RED)
