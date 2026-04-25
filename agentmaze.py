@@ -6,6 +6,7 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 import random
 import os
+import heapq
 
 GRID_SIZE = 30    
 CELL_SIZE = 20    
@@ -16,7 +17,8 @@ BLACK = (0, 0, 0)
 BLUE = (0, 0, 255)    
 GREEN = (0, 255, 0)   
 GRAY = (200, 200, 200)
-RED = (255, 0, 0)    
+RED = (255, 0, 0)
+LIGHT_BLUE = (173, 216, 230)  # Цвет для желательных препятствий    
 AGENT_SPEED_MS = 100  # Увеличено для замедления агента  
 
 class MazeEnvWithLearning(gym.Env):
@@ -29,7 +31,7 @@ class MazeEnvWithLearning(gym.Env):
         self.grid_size = grid_size
         self.map_type = map_type
         self.action_space = spaces.Discrete(4)  # 0=вверх, 1=вправо, 2=вниз, 3=влево
-        self.observation_space = spaces.Box(low=0, high=3, shape=(grid_size, grid_size), dtype=np.int8)
+        self.observation_space = spaces.Box(low=0, high=4, shape=(grid_size, grid_size), dtype=np.int8)
         self.max_steps = 500
         self.step_count = 0
         self.episode_count = 0
@@ -116,18 +118,20 @@ class MazeEnvWithLearning(gym.Env):
     
     def _bfs_search(self, start, goal, grid, visited=None):
         """
-        Поиск в ширину (BFS) для нахождения оптимального пути.
-        Учитывает посещённые клетки для избежания циклов.
+        A* поиск с учётом стоимости: желательные клетки (4) имеют стоимость 0.5, обычные 1.0.
+        Это делает пути через желательные клетки предпочтительными.
         """
         if visited is None:
             visited = set()
         
         grid_size = grid.shape[0]
-        queue = deque([(start, [])])
+        # priority queue: (total_cost, position, path)
+        pq = []
+        heapq.heappush(pq, (0, start, []))
         visited.add(start)
         
-        while queue:
-            current, path = queue.popleft()
+        while pq:
+            cost, current, path = heapq.heappop(pq)
             
             if current == goal:
                 return [start] + path
@@ -138,7 +142,9 @@ class MazeEnvWithLearning(gym.Env):
                 if 0 <= r < grid_size and 0 <= c < grid_size:
                     if grid[r, c] != 1 and (r, c) not in visited:
                         visited.add((r, c))
-                        queue.append(((r, c), path + [(r, c)]))
+                        # Стоимость шага: 0.5 для желательных клеток, 1.0 для обычных
+                        step_cost = 0.5 if grid[r, c] == 4 else 1.0
+                        heapq.heappush(pq, (cost + step_cost, (r, c), path + [(r, c)]))
         
         return None  # Путь не найден
     
@@ -353,6 +359,7 @@ class MazeEnvWithLearning(gym.Env):
             self.last_collision = False
             self.last_action = action
             self.last_pos = tuple(old_pos)
+            old_cell_val = self.grid[self.agent_pos[0], self.agent_pos[1]]  # Сохраняем значение клетки перед перемещением
             if tuple(self.agent_pos) in self.visited:
                 # Штраф за повторение позиции, но используем историю, чтобы избегать циклов
                 reward = -1.2
@@ -365,6 +372,9 @@ class MazeEnvWithLearning(gym.Env):
                     reward -= 0.1
                 if self.agent_pos[1] <= 1 or self.agent_pos[1] >= self.grid_size - 2:
                     reward -= 0.1
+                # Бонус за прохождение через желательное препятствие
+                if old_cell_val == 4:
+                    reward += 5.0
             else:
                 new_distance = abs(self.agent_pos[0] - self.target_pos[0]) + abs(self.agent_pos[1] - self.target_pos[1])
                 if new_distance < old_distance:
@@ -385,6 +395,9 @@ class MazeEnvWithLearning(gym.Env):
                 self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
                 self.visited.add(tuple(self.agent_pos))
                 self.position_history.append(tuple(self.agent_pos))
+                # Бонус за прохождение через желательное препятствие
+                if old_cell_val == 4:
+                    reward += 5.0
         
         if self.agent_pos == self.target_pos:
             reward = 50.0  # Значительно повышена награда за достижение цели
@@ -398,7 +411,7 @@ class MazeEnvWithLearning(gym.Env):
 
 def get_next_best_step(grid, start_pos, target_pos, visited=None):
     """
-    Поиск пути в ширину (BFS). Строит оптимальный маршрут к цели, избегая посещенных позиций.
+    A* поиск с учётом стоимости для построения предпочтительного маршрута к цели.
     """
     if visited is None:
         visited_bfs = set()
@@ -409,11 +422,13 @@ def get_next_best_step(grid, start_pos, target_pos, visited=None):
     start = tuple(start_pos)
     goal = tuple(target_pos)
     
-    queue = deque([(start, [])])
+    # priority queue: (total_cost, position, path)
+    pq = []
+    heapq.heappush(pq, (0, start, []))
     visited_bfs.add(start)
     
-    while queue:
-        current, path = queue.popleft()
+    while pq:
+        cost, current, path = heapq.heappop(pq)
         
         if current == goal:
             return list(path[0]) if path else list(current)
@@ -424,7 +439,9 @@ def get_next_best_step(grid, start_pos, target_pos, visited=None):
             if 0 <= r < grid_size and 0 <= c < grid_size:
                 if grid[r, c] != 1 and (r, c) not in visited_bfs:
                     visited_bfs.add((r, c))
-                    queue.append(((r, c), path + [(r, c)]))
+                    # Стоимость шага: 0.5 для желательных клеток, 1.0 для обычных
+                    step_cost = 0.5 if grid[r, c] == 4 else 1.0
+                    heapq.heappush(pq, (cost + step_cost, (r, c), path + [(r, c)]))
                     
     return None
 
@@ -488,6 +505,7 @@ if __name__ == "__main__":
     
     is_drawing = False
     draw_value = 1
+    draw_type = 1  # 1 для стен, 4 для желательных препятствий
     last_grid_state = grid.copy()  # Отслеживаем последнее состояние сетки
     grid_changed = False
 
@@ -543,8 +561,9 @@ if __name__ == "__main__":
                         message = f"Размер изменен на {current_grid_size}x{current_grid_size}"
                 
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:
+                if event.button == 1:  # Левая кнопка - стены
                     is_drawing = True
+                    draw_type = 1
                     x, y = event.pos
                     col = x // CELL_SIZE
                     row = y // CELL_SIZE
@@ -553,9 +572,20 @@ if __name__ == "__main__":
                         draw_value = 0 if grid[row, col] == 1 else 1
                         grid[row, col] = draw_value
                         env.grid[row, col] = draw_value
+                elif event.button == 3:  # Правая кнопка - желательные препятствия
+                    is_drawing = True
+                    draw_type = 4
+                    x, y = event.pos
+                    col = x // CELL_SIZE
+                    row = y // CELL_SIZE
+                    
+                    if 0 <= row < current_grid_size and grid[row, col] not in [2, 3]:
+                        draw_value = 0 if grid[row, col] == 4 else 4
+                        grid[row, col] = draw_value
+                        env.grid[row, col] = draw_value
             
             elif event.type == pygame.MOUSEBUTTONUP:
-                if event.button == 1:
+                if event.button == 1 or event.button == 3:
                     is_drawing = False
                     grid_changed = True  # Отмечаем, что лабиринт был изменен
                     
@@ -614,6 +644,8 @@ if __name__ == "__main__":
             
             if terminated:
                 message = f"Нейросеть достигла цели! (думал {env.think_count} раз)"
+                # Короткое обучение на новом опыте для адаптации к изменениям
+                model.learn(total_timesteps=100, reset_num_timesteps=False)
                 # Не запускаем длительное обучение в игровом цикле, чтобы не блокировать интерфейс
                 os.makedirs("models", exist_ok=True)
                 model.save(f"models/ppo_maze_model_{current_grid_size}")
@@ -654,6 +686,8 @@ if __name__ == "__main__":
                     pygame.draw.rect(window, GREEN, rect)
                 elif cell_val == 3: 
                     pygame.draw.circle(window, BLUE, rect.center, CELL_SIZE // 2 - 2)
+                elif cell_val == 4: 
+                    pygame.draw.rect(window, LIGHT_BLUE, rect)
 
         pygame.draw.rect(window, GRAY, (0, SCREEN_HEIGHT - 100, SCREEN_WIDTH, 100))
         text_surface = font.render(message, True, BLACK)
