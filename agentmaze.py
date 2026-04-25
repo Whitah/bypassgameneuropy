@@ -7,6 +7,7 @@ from stable_baselines3 import PPO
 import random
 import os
 import heapq
+import matplotlib.pyplot as plt
 
 GRID_SIZE = 30    
 CELL_SIZE = 20    
@@ -480,6 +481,34 @@ def create_env_and_model(grid_size, map_type="random"):
     return env, model, cell_size, screen_width, screen_height, message
 
 
+def update_stats_plot(rewards_history, steps_history, episodes_list):
+    """Обновление графиков статистики обучения"""
+    if not rewards_history:
+        return
+    
+    plt.ion()  # Интерактивный режим
+    plt.figure(figsize=(10, 6))
+    
+    plt.subplot(2, 1, 1)
+    plt.plot(episodes_list, rewards_history, 'b-', label='Награда за эпизод')
+    plt.title('Статистика обучения агента')
+    plt.xlabel('Эпизод')
+    plt.ylabel('Награда')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(2, 1, 2)
+    plt.plot(episodes_list, steps_history, 'r-', label='Шаги до цели')
+    plt.xlabel('Эпизод')
+    plt.ylabel('Количество шагов')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.draw()
+    plt.pause(0.1)  # Короткая пауза для обновления
+
+
 if __name__ == "__main__":
     pygame.init()
     pygame.font.init()
@@ -502,12 +531,27 @@ if __name__ == "__main__":
     running = True
     training_episodes = 0
     paused = False
+    agent_speed = 100  # Начальная скорость агента в мс
     
     is_drawing = False
     draw_value = 1
     draw_type = 1  # 1 для стен, 4 для желательных препятствий
     last_grid_state = grid.copy()  # Отслеживаем последнее состояние сетки
     grid_changed = False
+
+    # === Статистика для графиков ===
+    rewards_history = []
+    steps_history = []
+    episodes_list = []
+    total_rewards = 0  # Накопленная награда за эпизод
+    show_stats = False  # Флаг для показа графиков
+
+    # === Статистика для графиков ===
+    rewards_history = []
+    steps_history = []
+    episodes_list = []
+    total_rewards = 0  # Накопленная награда за эпизод
+    show_stats = False  # Флаг для показа графиков
 
     while running:
         current_time = pygame.time.get_ticks()
@@ -546,6 +590,20 @@ if __name__ == "__main__":
                     os.makedirs("models", exist_ok=True)
                     model.save(f"models/ppo_maze_model_{current_grid_size}")
                     message = "Ручное дообучение завершено и сохранено"
+                elif event.key == pygame.K_g and paused:
+                    show_stats = not show_stats
+                    if show_stats:
+                        update_stats_plot(rewards_history, steps_history, episodes_list)
+                        message = "Графики статистики показаны"
+                    else:
+                        plt.close('all')
+                        message = "Графики скрыты"
+                elif event.key == pygame.K_s:
+                    agent_speed = min(1000, agent_speed + 50)  # Не медленнее 1000 мс
+                    message = f"Скорость агента: {agent_speed} мс"
+                elif event.key == pygame.K_f:
+                    agent_speed = max(50, agent_speed - 50)  # Не быстрее 50 мс
+                    message = f"Скорость агента: {agent_speed} мс"
                 elif event.key in [pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5] and paused:
                     size_map = {pygame.K_1: 10, pygame.K_2: 20, pygame.K_3: 30, pygame.K_4: 40, pygame.K_5: 50}
                     new_size = size_map[event.key]
@@ -599,7 +657,7 @@ if __name__ == "__main__":
                         grid[row, col] = draw_value
                         env.grid[row, col] = draw_value
 
-        if current_time - last_move_time > AGENT_SPEED_MS and not paused:
+        if current_time - last_move_time > agent_speed and not paused:
             # Сбрасываем план при изменении лабиринта (БЕЗ обучения в цикле!)
             if grid_changed:
                 grid_changed = False
@@ -637,6 +695,7 @@ if __name__ == "__main__":
             obs, reward, terminated, truncated, _ = env.step(action)
             grid = obs.copy()
             agent_pos = env.agent_pos.copy()
+            total_rewards += reward  # Накопление награды за эпизод
             
             # Применяем штраф за обдумывание (если только что "подумали")
             if env.current_plan and env.plan_index <= len(env.current_plan):
@@ -644,6 +703,12 @@ if __name__ == "__main__":
             
             if terminated:
                 message = f"Нейросеть достигла цели! (думал {env.think_count} раз)"
+                # Сбор статистики
+                rewards_history.append(total_rewards)
+                steps_history.append(env.step_count)
+                episodes_list.append(training_episodes)
+                if show_stats:
+                    update_stats_plot(rewards_history, steps_history, episodes_list)
                 # Короткое обучение на новом опыте для адаптации к изменениям
                 model.learn(total_timesteps=100, reset_num_timesteps=False)
                 # Не запускаем длительное обучение в игровом цикле, чтобы не блокировать интерфейс
@@ -656,6 +721,7 @@ if __name__ == "__main__":
                 agent_pos = env.agent_pos.copy()
                 target_pos = env.target_pos.copy()
                 grid_changed = False  # Сбрасываем флаг при новом лабиринте
+                total_rewards = 0  # Сброс накопленной награды
                 message = f"Новый лабиринт! Пройдено эпизодов: {training_episodes}"
             elif truncated:
                 message = "Время вышло, перезапуск текущего лабиринта"
@@ -712,6 +778,11 @@ if __name__ == "__main__":
             fail_text = f"Путь закрыт! Попытка {env.failed_plan_count}/{env.max_failed_plans}"
             fail_surface = font.render(fail_text, True, RED)
             window.blit(fail_surface, (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT - 40))
+        
+        # Показываем текущую скорость агента
+        speed_text = f"Скорость: {agent_speed} мс"
+        speed_surface = font.render(speed_text, True, BLACK)
+        window.blit(speed_surface, (10, SCREEN_HEIGHT - 90))
         
         if paused:
             pause_text = font.render("ПАУЗА", True, RED)
