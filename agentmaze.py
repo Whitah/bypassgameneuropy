@@ -1,3 +1,4 @@
+import heapq
 import numpy as np
 import pygame
 from collections import deque
@@ -6,8 +7,6 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 import random
 import os
-import heapq
-import matplotlib.pyplot as plt
 
 GRID_SIZE = 30    
 CELL_SIZE = 20    
@@ -17,10 +16,11 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)     
 BLUE = (0, 0, 255)    
 GREEN = (0, 255, 0)   
+LIGHT_BLUE = (173, 216, 230)
 GRAY = (200, 200, 200)
-RED = (255, 0, 0)
-LIGHT_BLUE = (173, 216, 230)  # Цвет для желательных препятствий    
+RED = (255, 0, 0)    
 AGENT_SPEED_MS = 100  # Увеличено для замедления агента  
+MAP_TYPES = ["random", "triangle", "diamond", "circle", "duck"]
 
 class MazeEnvWithLearning(gym.Env):
     """Среда лабиринта с обучением PPO и двухуровневым планированием"""
@@ -55,13 +55,13 @@ class MazeEnvWithLearning(gym.Env):
     
     def think_ahead(self, model, num_steps=5):
         """
-        Нейросеть "думает" наперед - использует BFS для построения оптимального пути.
+        Нейросеть "думает" наперед - использует приоритетный поиск для построения предпочтительного пути.
         Возвращает план действий (список действий).
         
-        BFS гарантирует:
-        - Оптимальный путь к цели
-        - Без циклов
-        - С учётом стен
+        Поиск учитывает:
+        - оптимальную последовательность ходов
+        - стеновые препятствия
+        - желательные клетки 4, которые считаются дешевле
         
         Если путь не найден (заблокирован), сбрасывает visited после max_failed_plans попыток.
         """
@@ -119,20 +119,22 @@ class MazeEnvWithLearning(gym.Env):
     
     def _bfs_search(self, start, goal, grid, visited=None):
         """
-        A* поиск с учётом стоимости: желательные клетки (4) имеют стоимость 0.5, обычные 1.0.
+        Dijkstra-подобный поиск с учётом стоимости: желательные клетки (4) имеют стоимость 0.5, обычные 1.0.
         Это делает пути через желательные клетки предпочтительными.
         """
         if visited is None:
             visited = set()
         
         grid_size = grid.shape[0]
-        # priority queue: (total_cost, position, path)
         pq = []
         heapq.heappush(pq, (0, start, []))
-        visited.add(start)
+        costs = {start: 0}
         
         while pq:
             cost, current, path = heapq.heappop(pq)
+            
+            if cost > costs.get(current, float('inf')):
+                continue
             
             if current == goal:
                 return [start] + path
@@ -141,23 +143,42 @@ class MazeEnvWithLearning(gym.Env):
                 r, c = current[0] + dr, current[1] + dc
                 
                 if 0 <= r < grid_size and 0 <= c < grid_size:
-                    if grid[r, c] != 1 and (r, c) not in visited:
-                        visited.add((r, c))
-                        # Стоимость шага: 0.5 для желательных клеток, 1.0 для обычных
+                    if grid[r, c] != 1:
                         step_cost = 0.5 if grid[r, c] == 4 else 1.0
-                        heapq.heappush(pq, (cost + step_cost, (r, c), path + [(r, c)]))
+                        new_cost = cost + step_cost
+                        neighbor = (r, c)
+                        if neighbor not in visited or new_cost < costs.get(neighbor, float('inf')):
+                            costs[neighbor] = new_cost
+                            heapq.heappush(pq, (new_cost, neighbor, path + [neighbor]))
+                            visited.add(neighbor)
         
         return None  # Путь не найден
-    
+
+    def mark_desirable_walls(self, grid, density=0.08):
+        """Отмечает желательные препятствия (значение 4) в существующей карте."""
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if grid[r, c] == 0 and not (r == 0 and c == 0):
+                    if random.random() < density:
+                        grid[r, c] = 4
+        return grid
+
     def generate_grid(self):
         if self.map_type == "triangle":
             return self.generate_triangle_grid()
+        elif self.map_type == "diamond":
+            return self.generate_diamond_grid()
+        elif self.map_type == "circle":
+            return self.generate_circle_grid()
+        elif self.map_type == "duck":
+            return self.generate_duck_grid()
 
         grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
         for i in range(self.grid_size):
             for j in range(self.grid_size):
                 if random.random() < 0.1 and (i, j) != (0, 0) and (i, j) != (self.grid_size-1, self.grid_size-1):
                     grid[i, j] = 1
+        self.mark_desirable_walls(grid, density=0.08)
         return grid
 
     def generate_triangle_grid(self):
@@ -179,7 +200,82 @@ class MazeEnvWithLearning(gym.Env):
         grid[0, 0] = 0
         grid[self.grid_size - 1, 0] = 0
         return grid
-    
+
+    def generate_diamond_grid(self):
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        center = (self.grid_size - 1) / 2
+        radius = max(2, self.grid_size // 3)
+
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                inside_shape = abs(r - center) + abs(c - center) <= radius
+                if inside_shape:
+                    grid[r, c] = 1
+                else:
+                    if random.random() < 0.1 and not (r == 0 and c == 0):
+                        grid[r, c] = 1
+
+        # Открытая зона у старта
+        for r in range(0, 4):
+            for c in range(0, 4):
+                grid[r, c] = 0
+        self.mark_desirable_walls(grid, density=0.08)
+        return grid
+
+    def generate_circle_grid(self):
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        center = (self.grid_size - 1) / 2
+        radius = self.grid_size // 3
+
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                dist = ((r - center) ** 2 + (c - center) ** 2) ** 0.5
+                inside_shape = dist <= radius
+                if inside_shape:
+                    grid[r, c] = 1
+                else:
+                    if random.random() < 0.1 and not (r == 0 and c == 0):
+                        grid[r, c] = 1
+
+        # Открытая зона у старта
+        for r in range(0, 4):
+            for c in range(0, 4):
+                grid[r, c] = 0
+        self.mark_desirable_walls(grid, density=0.08)
+        return grid
+
+    def generate_duck_grid(self):
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        body_center = (self.grid_size * 0.55, self.grid_size * 0.35)
+        body_radius = (self.grid_size * 0.24, self.grid_size * 0.16)
+        head_center = (self.grid_size * 0.30, self.grid_size * 0.58)
+        head_radius = self.grid_size * 0.10
+
+        def in_duck(r, c):
+            inside_body = (((r - body_center[0]) / body_radius[0]) ** 2 + ((c - body_center[1]) / body_radius[1]) ** 2) <= 1
+            inside_head = ((r - head_center[0]) ** 2 + (c - head_center[1]) ** 2) <= head_radius ** 2
+            beak_top = (int(self.grid_size * 0.23), int(self.grid_size * 0.70))
+            beak_size = int(self.grid_size * 0.08)
+            inside_beak = False
+            if beak_top[0] <= r < min(self.grid_size, beak_top[0] + beak_size) and beak_top[1] <= c < min(self.grid_size, beak_top[1] + beak_size * 2):
+                inside_beak = c - beak_top[1] >= (r - beak_top[0]) * 1.2
+            return inside_body or inside_head or inside_beak
+
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if in_duck(r, c):
+                    grid[r, c] = 1
+                else:
+                    if random.random() < 0.1 and not (r == 0 and c == 0):
+                        grid[r, c] = 1
+
+        # Открытая зона у старта
+        for r in range(0, 4):
+            for c in range(0, 4):
+                grid[r, c] = 0
+        self.mark_desirable_walls(grid, density=0.08)
+        return grid
+
     def generate_target(self, min_distance=None):
         """
         Генерирует позицию цели (зеленый куб) далеко от агента.
@@ -360,7 +456,7 @@ class MazeEnvWithLearning(gym.Env):
             self.last_collision = False
             self.last_action = action
             self.last_pos = tuple(old_pos)
-            old_cell_val = self.grid[self.agent_pos[0], self.agent_pos[1]]  # Сохраняем значение клетки перед перемещением
+            old_cell_val = self.grid[self.agent_pos[0], self.agent_pos[1]]
             if tuple(self.agent_pos) in self.visited:
                 # Штраф за повторение позиции, но используем историю, чтобы избегать циклов
                 reward = -1.2
@@ -373,7 +469,6 @@ class MazeEnvWithLearning(gym.Env):
                     reward -= 0.1
                 if self.agent_pos[1] <= 1 or self.agent_pos[1] >= self.grid_size - 2:
                     reward -= 0.1
-                # Бонус за прохождение через желательное препятствие
                 if old_cell_val == 4:
                     reward += 5.0
             else:
@@ -396,7 +491,6 @@ class MazeEnvWithLearning(gym.Env):
                 self.grid[self.agent_pos[0], self.agent_pos[1]] = 3
                 self.visited.add(tuple(self.agent_pos))
                 self.position_history.append(tuple(self.agent_pos))
-                # Бонус за прохождение через желательное препятствие
                 if old_cell_val == 4:
                     reward += 5.0
         
@@ -412,7 +506,7 @@ class MazeEnvWithLearning(gym.Env):
 
 def get_next_best_step(grid, start_pos, target_pos, visited=None):
     """
-    A* поиск с учётом стоимости для построения предпочтительного маршрута к цели.
+    Поиск пути в ширину (BFS). Строит оптимальный маршрут к цели, избегая посещенных позиций.
     """
     if visited is None:
         visited_bfs = set()
@@ -423,13 +517,11 @@ def get_next_best_step(grid, start_pos, target_pos, visited=None):
     start = tuple(start_pos)
     goal = tuple(target_pos)
     
-    # priority queue: (total_cost, position, path)
-    pq = []
-    heapq.heappush(pq, (0, start, []))
+    queue = deque([(start, [])])
     visited_bfs.add(start)
     
-    while pq:
-        cost, current, path = heapq.heappop(pq)
+    while queue:
+        current, path = queue.popleft()
         
         if current == goal:
             return list(path[0]) if path else list(current)
@@ -440,9 +532,7 @@ def get_next_best_step(grid, start_pos, target_pos, visited=None):
             if 0 <= r < grid_size and 0 <= c < grid_size:
                 if grid[r, c] != 1 and (r, c) not in visited_bfs:
                     visited_bfs.add((r, c))
-                    # Стоимость шага: 0.5 для желательных клеток, 1.0 для обычных
-                    step_cost = 0.5 if grid[r, c] == 4 else 1.0
-                    heapq.heappush(pq, (cost + step_cost, (r, c), path + [(r, c)]))
+                    queue.append(((r, c), path + [(r, c)]))
                     
     return None
 
@@ -456,7 +546,7 @@ def create_env_and_model(grid_size, map_type="random"):
     screen_width = grid_size * cell_size
     screen_height = grid_size * cell_size + 100
     
-    model_path = f"models/ppo_maze_model_{grid_size}"
+    model_path = f"models/ppo_maze_model_{grid_size}_{map_type}"
     
     try:
         # Пытаемся загрузить существующую модель
@@ -481,34 +571,6 @@ def create_env_and_model(grid_size, map_type="random"):
     return env, model, cell_size, screen_width, screen_height, message
 
 
-def update_stats_plot(rewards_history, steps_history, episodes_list):
-    """Обновление графиков статистики обучения"""
-    if not rewards_history:
-        return
-    
-    plt.ion()  # Интерактивный режим
-    plt.figure(figsize=(10, 6))
-    
-    plt.subplot(2, 1, 1)
-    plt.plot(episodes_list, rewards_history, 'b-', label='Награда за эпизод')
-    plt.title('Статистика обучения агента')
-    plt.xlabel('Эпизод')
-    plt.ylabel('Награда')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(2, 1, 2)
-    plt.plot(episodes_list, steps_history, 'r-', label='Шаги до цели')
-    plt.xlabel('Эпизод')
-    plt.ylabel('Количество шагов')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.draw()
-    plt.pause(0.1)  # Короткая пауза для обновления
-
-
 if __name__ == "__main__":
     pygame.init()
     pygame.font.init()
@@ -531,27 +593,11 @@ if __name__ == "__main__":
     running = True
     training_episodes = 0
     paused = False
-    agent_speed = 100  # Начальная скорость агента в мс
     
     is_drawing = False
     draw_value = 1
-    draw_type = 1  # 1 для стен, 4 для желательных препятствий
     last_grid_state = grid.copy()  # Отслеживаем последнее состояние сетки
     grid_changed = False
-
-    # === Статистика для графиков ===
-    rewards_history = []
-    steps_history = []
-    episodes_list = []
-    total_rewards = 0  # Накопленная награда за эпизод
-    show_stats = False  # Флаг для показа графиков
-
-    # === Статистика для графиков ===
-    rewards_history = []
-    steps_history = []
-    episodes_list = []
-    total_rewards = 0  # Накопленная награда за эпизод
-    show_stats = False  # Флаг для показа графиков
 
     while running:
         current_time = pygame.time.get_ticks()
@@ -563,7 +609,7 @@ if __name__ == "__main__":
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
                     paused = not paused
-                    message = "Пауза: SPACE - продолжить, R - новый лабиринт, Q - выход, 1-5 - размер" if paused else "Продолжено"
+                    message = "Пауза: SPACE - продолжить, R - новый лабиринт, T - смена карты, L - ручное обучение, Q - выход, 1-5 - размер" if paused else "Продолжено"
                 elif event.key == pygame.K_r and paused:
                     # Перегенерировать лабиринт
                     obs, _ = env.reset()
@@ -574,7 +620,11 @@ if __name__ == "__main__":
                 elif event.key == pygame.K_q:
                     running = False
                 elif event.key == pygame.K_t and paused:
-                    current_map_type = "triangle" if current_map_type == "random" else "random"
+                    if current_map_type in MAP_TYPES:
+                        current_index = MAP_TYPES.index(current_map_type)
+                    else:
+                        current_index = 0
+                    current_map_type = MAP_TYPES[(current_index + 1) % len(MAP_TYPES)]
                     env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size, map_type=current_map_type)
                     window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
                     obs, _ = env.reset()
@@ -588,22 +638,8 @@ if __name__ == "__main__":
                     pygame.display.flip()
                     model.learn(total_timesteps=1024, reset_num_timesteps=False)
                     os.makedirs("models", exist_ok=True)
-                    model.save(f"models/ppo_maze_model_{current_grid_size}")
+                    model.save(f"models/ppo_maze_model_{current_grid_size}_{current_map_type}")
                     message = "Ручное дообучение завершено и сохранено"
-                elif event.key == pygame.K_g and paused:
-                    show_stats = not show_stats
-                    if show_stats:
-                        update_stats_plot(rewards_history, steps_history, episodes_list)
-                        message = "Графики статистики показаны"
-                    else:
-                        plt.close('all')
-                        message = "Графики скрыты"
-                elif event.key == pygame.K_s:
-                    agent_speed = min(1000, agent_speed + 50)  # Не медленнее 1000 мс
-                    message = f"Скорость агента: {agent_speed} мс"
-                elif event.key == pygame.K_f:
-                    agent_speed = max(50, agent_speed - 50)  # Не быстрее 50 мс
-                    message = f"Скорость агента: {agent_speed} мс"
                 elif event.key in [pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5] and paused:
                     size_map = {pygame.K_1: 10, pygame.K_2: 20, pygame.K_3: 30, pygame.K_4: 40, pygame.K_5: 50}
                     new_size = size_map[event.key]
@@ -619,26 +655,17 @@ if __name__ == "__main__":
                         message = f"Размер изменен на {current_grid_size}x{current_grid_size}"
                 
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:  # Левая кнопка - стены
+                if event.button == 1 or event.button == 3:
                     is_drawing = True
-                    draw_type = 1
                     x, y = event.pos
                     col = x // CELL_SIZE
                     row = y // CELL_SIZE
                     
                     if 0 <= row < current_grid_size and grid[row, col] not in [2, 3]:
-                        draw_value = 0 if grid[row, col] == 1 else 1
-                        grid[row, col] = draw_value
-                        env.grid[row, col] = draw_value
-                elif event.button == 3:  # Правая кнопка - желательные препятствия
-                    is_drawing = True
-                    draw_type = 4
-                    x, y = event.pos
-                    col = x // CELL_SIZE
-                    row = y // CELL_SIZE
-                    
-                    if 0 <= row < current_grid_size and grid[row, col] not in [2, 3]:
-                        draw_value = 0 if grid[row, col] == 4 else 4
+                        if event.button == 1:
+                            draw_value = 0 if grid[row, col] == 1 else 1
+                        else:
+                            draw_value = 0 if grid[row, col] == 4 else 4
                         grid[row, col] = draw_value
                         env.grid[row, col] = draw_value
             
@@ -657,7 +684,7 @@ if __name__ == "__main__":
                         grid[row, col] = draw_value
                         env.grid[row, col] = draw_value
 
-        if current_time - last_move_time > agent_speed and not paused:
+        if current_time - last_move_time > AGENT_SPEED_MS and not paused:
             # Сбрасываем план при изменении лабиринта (БЕЗ обучения в цикле!)
             if grid_changed:
                 grid_changed = False
@@ -695,7 +722,6 @@ if __name__ == "__main__":
             obs, reward, terminated, truncated, _ = env.step(action)
             grid = obs.copy()
             agent_pos = env.agent_pos.copy()
-            total_rewards += reward  # Накопление награды за эпизод
             
             # Применяем штраф за обдумывание (если только что "подумали")
             if env.current_plan and env.plan_index <= len(env.current_plan):
@@ -703,17 +729,9 @@ if __name__ == "__main__":
             
             if terminated:
                 message = f"Нейросеть достигла цели! (думал {env.think_count} раз)"
-                # Сбор статистики
-                rewards_history.append(total_rewards)
-                steps_history.append(env.step_count)
-                episodes_list.append(training_episodes)
-                if show_stats:
-                    update_stats_plot(rewards_history, steps_history, episodes_list)
-                # Короткое обучение на новом опыте для адаптации к изменениям
-                model.learn(total_timesteps=100, reset_num_timesteps=False)
                 # Не запускаем длительное обучение в игровом цикле, чтобы не блокировать интерфейс
                 os.makedirs("models", exist_ok=True)
-                model.save(f"models/ppo_maze_model_{current_grid_size}")
+                model.save(f"models/ppo_maze_model_{current_grid_size}_{current_map_type}")
                 training_episodes += 1
                 # Новый эпизод
                 obs, _ = env.reset()
@@ -721,7 +739,6 @@ if __name__ == "__main__":
                 agent_pos = env.agent_pos.copy()
                 target_pos = env.target_pos.copy()
                 grid_changed = False  # Сбрасываем флаг при новом лабиринте
-                total_rewards = 0  # Сброс накопленной награды
                 message = f"Новый лабиринт! Пройдено эпизодов: {training_episodes}"
             elif truncated:
                 message = "Время вышло, перезапуск текущего лабиринта"
@@ -752,7 +769,7 @@ if __name__ == "__main__":
                     pygame.draw.rect(window, GREEN, rect)
                 elif cell_val == 3: 
                     pygame.draw.circle(window, BLUE, rect.center, CELL_SIZE // 2 - 2)
-                elif cell_val == 4: 
+                elif cell_val == 4:
                     pygame.draw.rect(window, LIGHT_BLUE, rect)
 
         pygame.draw.rect(window, GRAY, (0, SCREEN_HEIGHT - 100, SCREEN_WIDTH, 100))
@@ -779,11 +796,6 @@ if __name__ == "__main__":
             fail_surface = font.render(fail_text, True, RED)
             window.blit(fail_surface, (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT - 40))
         
-        # Показываем текущую скорость агента
-        speed_text = f"Скорость: {agent_speed} мс"
-        speed_surface = font.render(speed_text, True, BLACK)
-        window.blit(speed_surface, (10, SCREEN_HEIGHT - 90))
-        
         if paused:
             pause_text = font.render("ПАУЗА", True, RED)
             window.blit(pause_text, (SCREEN_WIDTH - 100, SCREEN_HEIGHT - 70))
@@ -793,7 +805,8 @@ if __name__ == "__main__":
 
     # Сохраняем модель перед выходом
     os.makedirs("models", exist_ok=True)
-    model.save(f"models/ppo_maze_model_{current_grid_size}")
-    print(f"Модель сохранена в models/ppo_maze_model_{current_grid_size}")
+    model.save(f"models/ppo_maze_model_{current_grid_size}_{current_map_type}")
+    print(f"Модель сохранена в models/ppo_maze_model_{current_grid_size}_{current_map_type}")
     
     pygame.quit()
+
