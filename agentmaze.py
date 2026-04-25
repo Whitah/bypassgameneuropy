@@ -24,9 +24,10 @@ class MazeEnvWithLearning(gym.Env):
     
     metadata = {"render_modes": ["human"]}
     
-    def __init__(self, grid_size=30):
+    def __init__(self, grid_size=30, map_type="random"):
         super().__init__()
         self.grid_size = grid_size
+        self.map_type = map_type
         self.action_space = spaces.Discrete(4)  # 0=вверх, 1=вправо, 2=вниз, 3=влево
         self.observation_space = spaces.Box(low=0, high=3, shape=(grid_size, grid_size), dtype=np.int8)
         self.max_steps = 500
@@ -142,11 +143,34 @@ class MazeEnvWithLearning(gym.Env):
         return None  # Путь не найден
     
     def generate_grid(self):
+        if self.map_type == "triangle":
+            return self.generate_triangle_grid()
+
         grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
         for i in range(self.grid_size):
             for j in range(self.grid_size):
                 if random.random() < 0.1 and (i, j) != (0, 0) and (i, j) != (self.grid_size-1, self.grid_size-1):
                     grid[i, j] = 1
+        return grid
+
+    def generate_triangle_grid(self):
+        grid = np.ones((self.grid_size, self.grid_size), dtype=np.int8)
+        for r in range(self.grid_size):
+            for c in range(r + 1):
+                grid[r, c] = 0
+
+        # Гарантируем минимальный путь по левой границе
+        for r in range(self.grid_size):
+            grid[r, 0] = 0
+
+        # Добавляем лёгкие препятствия внутри треугольника
+        for r in range(1, self.grid_size):
+            for c in range(1, r + 1):
+                if random.random() < 0.08:
+                    grid[r, c] = 1
+
+        grid[0, 0] = 0
+        grid[self.grid_size - 1, 0] = 0
         return grid
     
     def generate_target(self, min_distance=None):
@@ -405,11 +429,11 @@ def get_next_best_step(grid, start_pos, target_pos, visited=None):
     return None
 
 
-def create_env_and_model(grid_size):
+def create_env_and_model(grid_size, map_type="random"):
     # Создаем папку для сохранения моделей, если её нет
     os.makedirs("models", exist_ok=True)
     
-    env = MazeEnvWithLearning(grid_size)
+    env = MazeEnvWithLearning(grid_size, map_type=map_type)
     cell_size = min(50, 600 // grid_size)
     screen_width = grid_size * cell_size
     screen_height = grid_size * cell_size + 100
@@ -444,7 +468,8 @@ if __name__ == "__main__":
     pygame.font.init()
     
     current_grid_size = 30
-    env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size)
+    current_map_type = "random"
+    env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size, map_type=current_map_type)
     
     window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption("Умный Агент: Большое поле с Нейросетью")
@@ -486,12 +511,29 @@ if __name__ == "__main__":
                     message = "Новый лабиринт сгенерирован"
                 elif event.key == pygame.K_q:
                     running = False
+                elif event.key == pygame.K_t and paused:
+                    current_map_type = "triangle" if current_map_type == "random" else "random"
+                    env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size, map_type=current_map_type)
+                    window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+                    obs, _ = env.reset()
+                    grid = obs.copy()
+                    agent_pos = env.agent_pos.copy()
+                    target_pos = env.target_pos.copy()
+                    training_episodes = 0
+                    message = f"Карта переключена на {current_map_type}. Нажмите R для нового лабиринта."
+                elif event.key == pygame.K_l and paused:
+                    message = "Запущено ручное обучение 1024 шага..."
+                    pygame.display.flip()
+                    model.learn(total_timesteps=1024, reset_num_timesteps=False)
+                    os.makedirs("models", exist_ok=True)
+                    model.save(f"models/ppo_maze_model_{current_grid_size}")
+                    message = "Ручное дообучение завершено и сохранено"
                 elif event.key in [pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5] and paused:
                     size_map = {pygame.K_1: 10, pygame.K_2: 20, pygame.K_3: 30, pygame.K_4: 40, pygame.K_5: 50}
                     new_size = size_map[event.key]
                     if new_size != current_grid_size:
                         current_grid_size = new_size
-                        env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size)
+                        env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size, map_type=current_map_type)
                         window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
                         obs, _ = env.reset()
                         grid = obs.copy()
@@ -572,18 +614,17 @@ if __name__ == "__main__":
             
             if terminated:
                 message = f"Нейросеть достигла цели! (думал {env.think_count} раз)"
-                # Обучение только после достижения цели (один раз, не в цикле!)
-                model.learn(total_timesteps=8000, reset_num_timesteps=False)
-                training_episodes += 1
+                # Не запускаем длительное обучение в игровом цикле, чтобы не блокировать интерфейс
                 os.makedirs("models", exist_ok=True)
                 model.save(f"models/ppo_maze_model_{current_grid_size}")
+                training_episodes += 1
                 # Новый эпизод
                 obs, _ = env.reset()
                 grid = obs.copy()
                 agent_pos = env.agent_pos.copy()
                 target_pos = env.target_pos.copy()
                 grid_changed = False  # Сбрасываем флаг при новом лабиринте
-                message = f"Новый лабиринт! Усиленных обучений: {training_episodes}"
+                message = f"Новый лабиринт! Пройдено эпизодов: {training_episodes}"
             elif truncated:
                 message = "Время вышло, перезапуск текущего лабиринта"
                 # Перезапуск текущего лабиринта без дополнительного обучения
