@@ -44,7 +44,7 @@ class MazeEnvWithLearning(gym.Env):
         self.position_history = deque(maxlen=50)
         self.blocked_dirs = {}
         
-        # === НОВОЕ: Двухуровневое планирование ===
+        
         self.think_steps = 5  # Сколько "мысленных" шагов делает нейросеть перед реальным ходом
         self.think_penalty = 0.05  # Штраф за каждый шаг обдумывания (время на размышления)
         self.current_plan = []  # Текущий план действий
@@ -150,9 +150,19 @@ class MazeEnvWithLearning(gym.Env):
         return None  # Путь не найден
     
     def generate_grid(self):
+        # Поддержка различных типов карт (фигуры в центре будут закрашены)
         if self.map_type == "triangle":
             return self.generate_triangle_grid()
+        elif self.map_type == "circle":
+            return self.generate_circle_grid()
+        elif self.map_type == "diamond":
+            return self.generate_diamond_grid()
+        elif self.map_type == "cross":
+            return self.generate_cross_grid()
+        elif self.map_type == "square":
+            return self.generate_square_grid()
 
+        # По умолчанию — случайные препятствия
         grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
         for i in range(self.grid_size):
             for j in range(self.grid_size):
@@ -161,23 +171,94 @@ class MazeEnvWithLearning(gym.Env):
         return grid
 
     def generate_triangle_grid(self):
-        grid = np.ones((self.grid_size, self.grid_size), dtype=np.int8)
-        for r in range(self.grid_size):
-            for c in range(r + 1):
-                grid[r, c] = 0
+        # Рисуем центрированный треугольник, оставляя отступ от краёв
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        margin = max(2, self.grid_size // 6)
+        cx = self.grid_size // 2
+        cy = self.grid_size // 2
+        max_height = self.grid_size - 2 * margin
+        height = max(3, max_height // 1)
+        height = min(height, max_height)
+        for dr in range(height):
+            row = cx - height // 2 + dr
+            half_width = int(((dr + 1) / height) * ((self.grid_size - 2 * margin) // 2))
+            for dc in range(-half_width, half_width + 1):
+                col = cy + dc
+                if margin <= row < self.grid_size - margin and margin <= col < self.grid_size - margin:
+                    grid[row, col] = 1
 
-        # Гарантируем минимальный путь по левой границе
-        for r in range(self.grid_size):
-            grid[r, 0] = 0
+        # Гарантируем, что старт и угол цели проходимы
+        grid[0, 0] = 0
+        grid[self.grid_size - 1, self.grid_size - 1] = 0
+        return grid
 
-        # Добавляем лёгкие препятствия внутри треугольника
-        for r in range(1, self.grid_size):
-            for c in range(1, r + 1):
-                if random.random() < 0.08:
+    def generate_circle_grid(self):
+        # Circle: filled disk in center, leaving margin from edges
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        margin = max(2, self.grid_size // 6)
+        cx = (self.grid_size - 1) / 2.0
+        cy = (self.grid_size - 1) / 2.0
+        max_radius = min(cx - margin, cy - margin)
+        radius = max(2, int(max_radius))
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if (r - cx) ** 2 + (c - cy) ** 2 <= radius ** 2 and margin <= r < self.grid_size - margin and margin <= c < self.grid_size - margin:
                     grid[r, c] = 1
 
         grid[0, 0] = 0
-        grid[self.grid_size - 1, 0] = 0
+        grid[self.grid_size - 1, self.grid_size - 1] = 0
+        return grid
+
+    def generate_diamond_grid(self):
+        # Diamond (Manhattan circle) centered and constrained by margin
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        margin = max(2, self.grid_size // 6)
+        cx = self.grid_size // 2
+        cy = self.grid_size // 2
+        max_radius = min(cx - margin, cy - margin)
+        radius = max(2, int(max_radius))
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if abs(r - cx) + abs(c - cy) <= radius and margin <= r < self.grid_size - margin and margin <= c < self.grid_size - margin:
+                    grid[r, c] = 1
+
+        grid[0, 0] = 0
+        grid[self.grid_size - 1, self.grid_size - 1] = 0
+        return grid
+
+    def generate_cross_grid(self):
+        # Cross: two perpendicular bars centered, not touching edges
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        margin = max(2, self.grid_size // 6)
+        cx = self.grid_size // 2
+        cy = self.grid_size // 2
+        thickness = max(1, self.grid_size // 10)
+        thickness = min(thickness, cx - margin)
+        for r in range(margin, self.grid_size - margin):
+            for c in range(margin, self.grid_size - margin):
+                if abs(r - cx) <= thickness or abs(c - cy) <= thickness:
+                    grid[r, c] = 1
+
+        grid[0, 0] = 0
+        grid[self.grid_size - 1, self.grid_size - 1] = 0
+        return grid
+
+    def generate_square_grid(self):
+        # Square centered with margin
+        grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+        margin = max(2, self.grid_size // 6)
+        max_size = self.grid_size - 2 * margin
+        size = max(3, max_size)
+        size = min(size, max_size)
+        start = (self.grid_size - size) // 2
+        end = start + size
+        for r in range(start, end):
+            for c in range(start, end):
+                if margin <= r < self.grid_size - margin and margin <= c < self.grid_size - margin:
+                    grid[r, c] = 1
+
+        grid[0, 0] = 0
+        grid[self.grid_size - 1, self.grid_size - 1] = 0
         return grid
     
     def generate_target(self, min_distance=None):
@@ -510,7 +591,7 @@ def draw_pause_menu(window, font, SCREEN_WIDTH, SCREEN_HEIGHT):
         "T: Переключить тип лабиринта",
         "L: Сохранить лабиринт",
         "K: Загрузить лабиринт",
-        "O: Ручное обучение (1024 шага)",
+        "CTRL: Очистить поле",
         "G: Графики статистики",
         "S: Замедлить агента",
         "F: Ускорить агента",
@@ -553,10 +634,11 @@ if __name__ == "__main__":
     
     current_grid_size = 30
     current_map_type = "random"
+    map_types = ["random", "triangle", "circle", "diamond", "cross", "square"]
     env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size, map_type=current_map_type)
     
     window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-    pygame.display.set_caption("Умный Агент: Большое поле с Нейросетью")
+    pygame.display.set_caption("ENJOY THE MEANDRE")
     font = pygame.font.SysFont('Arial', 18)
     clock = pygame.time.Clock()
     
@@ -617,7 +699,8 @@ if __name__ == "__main__":
                 elif event.key == pygame.K_q:
                     running = False
                 elif event.key == pygame.K_t and paused:
-                    current_map_type = "triangle" if current_map_type == "random" else "random"
+                    idx = map_types.index(current_map_type) if current_map_type in map_types else 0
+                    current_map_type = map_types[(idx + 1) % len(map_types)]
                     env, model, CELL_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, message = create_env_and_model(current_grid_size, map_type=current_map_type)
                     window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
                     obs, _ = env.reset()
@@ -652,13 +735,15 @@ if __name__ == "__main__":
                         message = "Лабиринт загружен (K)"
                     else:
                         message = "Нет сохраненного лабиринта"
-                elif event.key == pygame.K_o and paused:
-                    message = "Запущено ручное обучение 1024 шага..."
-                    pygame.display.flip()
-                    model.learn(total_timesteps=1024, reset_num_timesteps=False)
-                    os.makedirs("models", exist_ok=True)
-                    model.save(f"models/ppo_maze_model_{current_grid_size}")
-                    message = "Ручное дообучение завершено и сохранено"
+                elif event.key in (pygame.K_LCTRL, pygame.K_RCTRL) and paused:
+                    # Очищаем поле: удаляем все препятствия, кроме агента и цели
+                    for r in range(current_grid_size):
+                        for c in range(current_grid_size):
+                            if grid[r, c] not in (2, 3):
+                                grid[r, c] = 0
+                                env.grid[r, c] = 0
+                    grid_changed = True
+                    message = "Поле очищено (CTRL)"
                 elif event.key == pygame.K_g and paused:
                     show_stats = not show_stats
                     if show_stats:
